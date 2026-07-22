@@ -1,0 +1,15 @@
+[Unit]
+Description=Fasmagor Telegram Bot
+After=network.target ollama.service
+
+[Service]
+Type=simple
+User=sadoc
+WorkingDirectory=/home/sadoc/Dev/FasmaBot
+EnvironmentFile=/home/sadoc/Dev/FasmaBot/.env
+ExecStart=/home/sadoc/Dev/FasmaBot/venv/bin/python /home/sadoc/Dev/FasmaBot/bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
