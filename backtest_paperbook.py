@@ -64,6 +64,12 @@ def main() -> None:
     ret = (tot - pb.INITIAL_EUR) / pb.INITIAL_EUR * 100
     print(f"Rendimento simulato: {'+' if ret>=0 else ''}{ret:.2f}% "
           f"({tot - pb.INITIAL_EUR:+.2f} €)")
+    # breakdown per stile (standard vs micro)
+    from collections import Counter
+    styles = Counter(t.get("setup", {}).get("style", "?") for t in state.get("closed", []))
+    sig_styles = Counter(s.get("style", "?") for s in state.get("signals", []))
+    print(f"Trade chiusi per stile: {dict(styles)}")
+    print(f"Signal per stile: {dict(sig_styles)}")
 
 
 if __name__ == "__main__":

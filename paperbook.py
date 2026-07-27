@@ -26,11 +26,6 @@ from stock import load_watchlist, ET_TZ
 
 STATE_FILE    = Path(__file__).parent / "paperbook_state.json"
 INITIAL_EUR   = 500.0
-RISK_PCT      = 0.02          # 2% di rischio per trade
-MAX_STOP_PCT  = 0.08          # setup "largo" oltre l'8% -> si passa
-CAP_POS_PCT   = 0.50          # cap 50% equity su una posizione
-TARGET_R      = 2.0           # target a +2R
-TIME_STOP_DAY = 5             # sedute senza progresso -> time stop
 TAX_PCT       = 0.26          # plusvalenze IT
 COMMISSION_MIN_USD  = 0.35
 COMMISSION_PER_SH   = 0.005
@@ -39,6 +34,35 @@ FX_FEE_MIN_USD = 2.0          # costo cambio IBKR (minimo 2 $)
 FX_FEE_RATE    = 0.00002      # 0,002%
 SPY_TICKER     = "SPY"
 FX_TICKER      = "EURUSD=X"   # 1 EUR = X USD
+
+# Parametri per regime di prezzo. Strategia 1 (Standard) per ticker > 5 $,
+# "Micro-Breakout" (1-5 $) per penny/small-cap. Stessa architettura, soglie
+# adattate alla volatilità più alta. Sotto 1 $ escluso (micro-cap illiquida).
+STANDARD = {
+    "name": "standard", "price_min": 5.0, "price_max": 150.0,
+    "avg_vol_min": 500_000, "vol_ratio_min": 1.5,
+    "base_window": 30, "base_range_max": 0.15, "high_52w_factor": 0.88,
+    "stop_max": 0.08, "risk_pct": 0.02, "cap_pos": 0.50,
+    "target_r": 2.0, "time_stop_days": 5, "require_sma200": True,
+}
+MICRO = {
+    "name": "micro", "price_min": 1.0, "price_max": 5.0,
+    "avg_vol_min": 300_000, "vol_ratio_min": 2.0,
+    "base_window": 40, "base_range_max": 0.25, "high_52w_factor": 0.80,
+    "stop_max": 0.12, "risk_pct": 0.01, "cap_pos": 0.25,
+    "target_r": 1.5, "time_stop_days": 3, "require_sma200": False,
+}
+
+
+def style_for_price(close: float) -> str:
+    """Regime di strategia in base al prezzo di chiusura."""
+    if 1.0 <= close < 5.0:
+        return "micro"
+    return "standard"
+
+
+def params_for(style: str) -> dict:
+    return MICRO if style == "micro" else STANDARD
 
 
 # ── Stato persistente ─────────────────────────────────────────────────────────
@@ -109,7 +133,11 @@ def _sma(series: pd.Series, n: int) -> float | None:
 
 
 def setup_breakdown(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
-    """Valuta ogni condizione separatamente. Ritorna dict di bool + metriche."""
+    """Valuta ogni condizione separatamente. Ritorna dict di bool + metriche.
+
+    I parametri (soglie, risk, target, time-stop) sono dinamici in base al
+    prezzo: regime 'micro' per 1-5 $, 'standard' per > 5 $.
+    """
     out = {"ok": False, "reason": "no-data", "metrics": {}}
     if df is None or len(df) < 51:
         return out
@@ -120,12 +148,17 @@ def setup_breakdown(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame) -> dict
     vol   = float(today["Volume"])
     avg_vol_50 = float(prior["Volume"].iloc[-50:].mean()) if len(prior) >= 50 else 0
 
-    out["metrics"] = {"close": close, "avg_vol_50": avg_vol_50}
-
-    # Filtro micro
-    if not (5.0 <= close <= 150.0):
+    # selezione regime in base al prezzo
+    if close < 1.0:
+        out["reason"] = "price-too-low"; return out
+    if close > 150.0:
         out["reason"] = "price-out"; return out
-    if avg_vol_50 < 500_000:
+    style = style_for_price(close)
+    P = params_for(style)
+    out["metrics"] = {"close": close, "avg_vol_50": avg_vol_50, "style": style}
+
+    # Filtro liquidità
+    if avg_vol_50 < P["avg_vol_min"]:
         out["reason"] = "low-volume"; return out
 
     # 1) trend
@@ -134,11 +167,12 @@ def setup_breakdown(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame) -> dict
     sma200 = _sma(closes_inc, 200) if len(df) >= 200 else None
     if sma50 is None or close <= sma50:
         out["reason"] = "no-trend-close"; return out
-    if sma200 is not None and sma50 <= sma200:
+    if P["require_sma200"] and sma200 is not None and sma50 <= sma200:
         out["reason"] = "no-trend-sma"; return out
 
     # 2) base
-    base_hi = prior["High"].iloc[-30:] if len(prior) >= 30 else prior["High"]
+    bw = P["base_window"]
+    base_hi = prior["High"].iloc[-bw:] if len(prior) >= bw else prior["High"]
     base_lo = prior["Low"].loc[base_hi.index]
     if base_lo.min() <= 0:
         out["reason"] = "base-data"; return out
@@ -146,13 +180,13 @@ def setup_breakdown(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame) -> dict
     high_52w = float(prior["High"].iloc[-252:].max()) if len(prior) >= 10 else float(prior["High"].max())
     out["metrics"]["base_range"] = base_range
     out["metrics"]["high_52w"] = high_52w
-    if base_range >= 0.15:
+    if base_range >= P["base_range_max"]:
         out["reason"] = "base-wide"; return out
-    if close < high_52w * 0.88:
+    if close < high_52w * P["high_52w_factor"]:
         out["reason"] = "far-from-highs"; return out
 
     # 3) chiusura sopra resistenza
-    res = float(prior["High"].iloc[-30:].max()) if len(prior) >= 30 else float(prior["High"].max())
+    res = float(prior["High"].iloc[-bw:].max()) if len(prior) >= bw else float(prior["High"].max())
     out["metrics"]["res"] = res
     if close < res * 1.005:
         out["reason"] = "no-breakout"; return out
@@ -160,7 +194,7 @@ def setup_breakdown(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame) -> dict
     # 4) volume
     vol_ratio = vol / avg_vol_50 if avg_vol_50 > 0 else 0
     out["metrics"]["vol_ratio"] = vol_ratio
-    if vol_ratio < 1.5:
+    if vol_ratio < P["vol_ratio_min"]:
         out["reason"] = "low-volume-day"; return out
 
     # 5) SPY
@@ -172,7 +206,7 @@ def setup_breakdown(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame) -> dict
     stop_hint = low - 0.05
     stop_pct = (close - stop_hint) / close
     out["metrics"]["stop_pct"] = stop_pct
-    if stop_pct > MAX_STOP_PCT:
+    if stop_pct > P["stop_max"]:
         out["reason"] = "stop-too-wide"; return out
 
     out["ok"] = True
@@ -187,14 +221,18 @@ def check_setup(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame) -> dict | N
         return None
     m = bd["metrics"]
     res, close = m["res"], m["close"]
+    style = m["style"]
+    P = params_for(style)
     real_low = float(df.iloc[-1]["Low"])
     stop = real_low - 0.05
-    target = close + TARGET_R * (close - stop)
+    target = close + P["target_r"] * (close - stop)
     return {
         "symbol": symbol, "res": round(res, 4), "close": round(close, 4),
         "stop_hint": round(stop, 4), "target_hint": round(target, 4),
         "vol_ratio": round(m["vol_ratio"], 2), "stop_pct": round(m["stop_pct"], 4),
         "score": round(m["vol_ratio"] + (close - res) / res * 100, 2),
+        "style": style, "target_r": P["target_r"], "risk_pct": P["risk_pct"],
+        "cap_pos": P["cap_pos"], "time_stop_days": P["time_stop_days"],
     }
 
 
@@ -218,21 +256,21 @@ def _entry(state: dict, setup: dict, open_price: float, fx: float, date: str) ->
     # Anti-inseguimento: open oltre +3% sopra la resistenza -> salta
     if open_price > setup["res"] * 1.03:
         return None
+    P = params_for(setup.get("style", "standard"))
     equity_usd = _equity_usd(state, None)
-    risk_eur = RISK_PCT * (equity_usd / fx)        # equity EUR -> rischio 2%
+    risk_eur = P["risk_pct"] * (equity_usd / fx)        # equity EUR -> rischio (1% micro / 2% standard)
     risk_usd = risk_eur * fx
     stop = setup["stop_hint"]
     risk_pct = (open_price - stop) / open_price
-    if risk_pct <= 0 or risk_pct > MAX_STOP_PCT:
+    if risk_pct <= 0 or risk_pct > P["stop_max"]:
         return None
     target_usd = risk_usd / risk_pct
-    max_usd = equity_usd * CAP_POS_PCT
+    max_usd = equity_usd * P["cap_pos"]
     invest_usd = min(target_usd, max_usd)
     shares = invest_usd / open_price
     comm = _commission(shares)
     cost = shares * open_price + comm
     if cost > state["cash_usd"]:
-        invest_usd = (state["cash_usd"] - comm) / open_price * open_price
         shares = (state["cash_usd"] - comm) / open_price
         cost = shares * open_price + comm
         if shares <= 0:
@@ -241,15 +279,18 @@ def _entry(state: dict, setup: dict, open_price: float, fx: float, date: str) ->
     state["position"] = {
         "symbol": setup["symbol"], "shares": round(shares, 6),
         "entry": round(open_price, 4), "stop": round(stop, 4),
-        "target": round(open_price + TARGET_R * (open_price - stop), 4),
+        "target": round(open_price + P["target_r"] * (open_price - stop), 4),
         "res": setup["res"], "entry_date": date, "entry_fx": fx,
         "comm_usd": comm, "cost_basis": round(cost, 4),
         "risk_eur": round(risk_eur, 2),
+        "style": setup.get("style", "standard"),
+        "target_r": P["target_r"], "time_stop_days": P["time_stop_days"],
         # setup che ha generato l'operazione (memoria storica)
         "setup": {
             "signal_close": setup["close"], "res": setup["res"],
             "vol_ratio": setup["vol_ratio"], "stop_pct": setup["stop_pct"],
             "score": setup["score"], "signal_date": setup.get("signal_date", date),
+            "style": setup.get("style", "standard"),
         },
     }
     return {"kind": "entry", "date": date, "position": state["position"]}
@@ -300,9 +341,9 @@ def _evaluate_exit(pos: dict, row: pd.Series, date: str) -> tuple[float, str] | 
     # Uscita di emergenza: close sotto il livello rotto
     if close < pos["res"]:
         return close, "fakeout"
-    # Time stop: 5 sedute senza progresso (close ancora sotto l'entry)
+    # Time stop: N sedute senza progresso (close ancora sotto l'entry)
     held = _trading_days_between(pos["entry_date"], date)
-    if held >= TIME_STOP_DAY and close < pos["entry"]:
+    if held >= pos.get("time_stop_days", 5) and close < pos["entry"]:
         return close, "time-stop"
     return None
 
@@ -365,6 +406,7 @@ def step_close(state: dict, date: pd.Timestamp, bars: dict, fx_df: pd.DataFrame)
                 "date": ds, "symbol": best["symbol"], "res": best["res"],
                 "close": best["close"], "vol_ratio": best["vol_ratio"],
                 "stop_hint": best["stop_hint"], "score": best["score"],
+                "style": best.get("style", "standard"),
             })
             events.append({"kind": "signal", "date": ds, "setup": best})
 
@@ -436,9 +478,11 @@ def build_event_report(state: dict, event: dict, fx: float, last_prices: dict[st
 
     if event["kind"] == "entry":
         p = event["position"]
-        body = (f"🟢 LONG {p['symbol']} @ ${p['entry']:.2f}\n"
-                f"Stop: ${p['stop']:.2f} · Target: ${p['target']:.2f} (+2R)\n"
-                f"Size: {p['shares']:.2f} az · Rischio: {p['risk_eur']:.2f} € (2%)\n"
+        style_tag = " · MICRO" if p.get("style") == "micro" else ""
+        tr = p.get("target_r", 2.0)
+        body = (f"🟢 LONG{style_tag} {p['symbol']} @ ${p['entry']:.2f}\n"
+                f"Stop: ${p['stop']:.2f} · Target: ${p['target']:.2f} (+{tr}R)\n"
+                f"Size: {p['shares']:.2f} az · Rischio: {p['risk_eur']:.2f} €\n"
                 f"Commissione: {p['comm_usd']:.2f} $")
         return header + body
 
