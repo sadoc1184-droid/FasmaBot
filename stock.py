@@ -1,7 +1,7 @@
 """Stock monitor — data and report logic."""
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytz
@@ -10,6 +10,7 @@ import yfinance as yf
 WATCHLIST_FILE = Path(__file__).parent / "watchlist.json"
 STATE_FILE     = Path(__file__).parent / "monitor_state.json"
 HISTORY_FILE   = Path(__file__).parent / "report_history.json"
+HISTORY_MAX_DAYS = 30
 ET_TZ          = pytz.timezone("America/New_York")
 
 
@@ -56,6 +57,30 @@ def save_history(history: list) -> None:
         json.dumps(history, indent=2),
         encoding="utf-8",
     )
+
+
+def _prune_history(history: list) -> list:
+    """Drop snapshots older than HISTORY_MAX_DAYS.
+
+    Parses each timestamp with fromisoformat so malformed entries (missing or
+    non-ISO ts) are dropped rather than kept by accident. Aware-of-DST
+    comparison via real datetime objects.
+    """
+    cutoff = datetime.now(ET_TZ) - timedelta(days=HISTORY_MAX_DAYS)
+    kept = []
+    for e in history:
+        ts = e.get("ts")
+        if not ts:
+            continue
+        try:
+            when = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = ET_TZ.localize(when)
+        if when >= cutoff:
+            kept.append(e)
+    return kept
 
 
 # ── Price data ────────────────────────────────────────────────────────────────
@@ -154,6 +179,7 @@ def build_report() -> str:
     lines = [line for _, line in rows]
 
     history = load_history()
+    history = _prune_history(history)
     history.append({"ts": now.isoformat(), "tickers": valid})
     save_history(history)
 
@@ -165,7 +191,7 @@ def build_compare() -> str:
     if not tickers:
         return "⚠️ Watchlist vuota."
 
-    history = load_history()
+    history = _prune_history(load_history())
     pct_by_sym: dict[str, list[float]] = {sym: [] for sym in tickers}
     for snap in history:
         for entry in snap.get("tickers", []):

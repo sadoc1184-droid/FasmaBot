@@ -7,3 +7,4 @@ __pycache__/
 monitor_state.json
 report_history.json
 watchlist.json
+paperbook_state.json

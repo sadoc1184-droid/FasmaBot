@@ -36,6 +36,17 @@ from stock import (
     validate_ticker,
     ET_TZ,
 )
+from paperbook import (
+    build_event_report,
+    build_status,
+    equity_eur,
+    init_state,
+    live_step,
+    load_state as pb_load_state,
+    save_state as pb_save_state,
+    set_enabled,
+    STATE_FILE as PB_STATE_FILE,
+)
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -124,6 +135,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stato — stato del monitor\n"
         "/pausa — sospende i report automatici\n"
         "/riprendi — riattiva i report automatici\n\n"
+        "*Simulazione breakout (admin):*\n"
+        "/sim — stato simulazione (capitale, posizione, P&L)\n"
+        "/sim_on — attiva la simulazione (500 € su IBKR simulato)\n"
+        "/sim_off — disattiva\n"
+        "/sim_reset — azzera stato simulazione\n\n"
         "*Capacità chat:*\n"
         "• Testo → GLM risponde\n"
         "• Foto → Claude analizza, GLM usa i dati\n"
@@ -300,6 +316,68 @@ async def cmd_riprendi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("▶️ Report automatici riattivati.")
 
 
+# ── Simulazione breakout (paperbook) ──────────────────────────────────────────
+
+def _sim_state() -> dict:
+    return pb_load_state()
+
+
+async def cmd_sim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _check_admin(update):
+        return
+    state = _sim_state()
+    if not state:
+        await update.message.reply_text(
+            "📈 Simulazione non inizializzata. Usa /sim_on per attivarla (capitale 500 €).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    # prezzi live per lo stato
+    import yfinance as yf
+    fx = float(yf.Ticker("EURUSD=X").fast_info.last_price)
+    pos = state.get("position")
+    last_px = {}
+    if pos:
+        last_px[pos["symbol"]] = float(yf.Ticker(pos["symbol"]).fast_info.last_price)
+    enabled = "✅ attiva" if state.get("enabled") else "⏸ in pausa"
+    text = build_status(state, fx, last_px) + f"\n\nStato: {enabled}"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_sim_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _check_admin(update):
+        return
+    state = _sim_state()
+    if not state:
+        import yfinance as yf
+        fx = float(yf.Ticker("EURUSD=X").fast_info.last_price)
+        state = init_state(fx)
+        pb_save_state(state)
+    set_enabled(state, True)
+    await update.message.reply_text(
+        "📈 Simulazione breakout ATTIVA.\n"
+        "Valutazione entry alle 09:35 ET, exit/checklist alle 16:10 ET.\n"
+        "Report arrivano solo su operazione. Capitale 500 € su IBKR simulato.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_sim_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _check_admin(update):
+        return
+    state = _sim_state()
+    if state:
+        set_enabled(state, False)
+    await update.message.reply_text("⏸ Simulazione breakout disattivata.")
+
+
+async def cmd_sim_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _check_admin(update):
+        return
+    PB_STATE_FILE.unlink(missing_ok=True)
+    await update.message.reply_text("🔄 Stato simulazione azzerato. Usa /sim_on per ripartire.")
+
+
 # ── Scheduled report ──────────────────────────────────────────────────────────
 
 async def job_report(context: ContextTypes.DEFAULT_TYPE):
@@ -312,6 +390,35 @@ async def job_report(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             log.error("job_report → %s fallito: %s", uid, e)
+
+
+async def _job_sim(context: ContextTypes.DEFAULT_TYPE, phase: str) -> None:
+    state = _sim_state()
+    if not state or not state.get("enabled"):
+        return
+    try:
+        events, fx, last_px = live_step(phase, state)
+    except Exception as e:
+        log.error("job_sim %s → live_step fallito: %s", phase, e)
+        return
+    # report solo per operazioni eseguite (entry/exit), non per i signal
+    for ev in events:
+        if ev["kind"] not in ("entry", "exit"):
+            continue
+        text = build_event_report(state, ev, fx, last_px)
+        for uid in ALLOWED_USER_IDS:
+            try:
+                await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                log.error("job_sim → %s fallito: %s", uid, e)
+
+
+async def job_sim_open(context: ContextTypes.DEFAULT_TYPE):
+    await _job_sim(context, "open")
+
+
+async def job_sim_close(context: ContextTypes.DEFAULT_TYPE):
+    await _job_sim(context, "close")
 
 
 # ── Message handler ───────────────────────────────────────────────────────────
@@ -415,11 +522,17 @@ def main():
     app.add_handler(CommandHandler("stato",    cmd_stato))
     app.add_handler(CommandHandler("pausa",    cmd_pausa))
     app.add_handler(CommandHandler("riprendi", cmd_riprendi))
+    app.add_handler(CommandHandler("sim",      cmd_sim))
+    app.add_handler(CommandHandler("sim_on",   cmd_sim_on))
+    app.add_handler(CommandHandler("sim_off",  cmd_sim_off))
+    app.add_handler(CommandHandler("sim_reset",cmd_sim_reset))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
 
     app.job_queue.run_daily(job_report, time=dt_time(9, 30, tzinfo=ET_TZ),  name="report_open")
     app.job_queue.run_daily(job_report, time=dt_time(12, 45, tzinfo=ET_TZ), name="report_mid")
     app.job_queue.run_daily(job_report, time=dt_time(16, 0, tzinfo=ET_TZ), name="report_close")
+    app.job_queue.run_daily(job_sim_open,  time=dt_time(9, 35, tzinfo=ET_TZ), name="sim_open")
+    app.job_queue.run_daily(job_sim_close, time=dt_time(16, 10, tzinfo=ET_TZ), name="sim_close")
 
     log.info("Fasmagor avviato. In ascolto...")
     app.run_polling()
