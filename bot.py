@@ -47,6 +47,7 @@ from paperbook import (
     set_enabled,
     STATE_FILE as PB_STATE_FILE,
 )
+from astro import ROME_TZ_SCHED, build_astro_message, is_draw_day, send_astro_report
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -68,6 +69,15 @@ ADMIN_USER_IDS = {
 OLLAMA_URL    = "http://localhost:11434/api/chat"
 GLM_MODEL     = "glm-5.2:cloud"
 SYSTEM_PROMPT = build_system_prompt(fmt="bot")
+
+# Report di mercato automatici (09:30 / 12:45 / 16:00 ET) sospesi su richiesta
+# il 2026-08-12. Rimettere a True per riattivarli: i job tornano a registrarsi
+# e job_report riprende a inviare. Il comando /report manuale resta attivo.
+MARKET_REPORTS_ENABLED = False
+
+# Report Astrosoldi (prossima estrazione SuperEnalotto), ore 09:00 Europe/Rome
+# nei giorni di estrazione. Consegnato ai soli destinatari Astrosoldi.
+ASTRO_REPORT_TIME = dt_time(9, 0, tzinfo=ROME_TZ_SCHED)
 
 
 # ── GLM ───────────────────────────────────────────────────────────────────────
@@ -134,7 +144,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/confronta — media storica per ticker\n"
         "/stato — stato del monitor\n"
         "/pausa — sospende i report automatici\n"
-        "/riprendi — riattiva i report automatici\n\n"
+        "/riprendi — riattiva i report automatici\n"
+        "⚠️ report automatici temporaneamente sospesi — /report resta attivo\n\n"
+        "*Astrosoldi (admin):*\n"
+        "/astro — report della prossima estrazione\n\n"
         "*Simulazione breakout (admin):*\n"
         "/sim — stato simulazione (capitale, posizione, P&L)\n"
         "/sim_on — attiva la simulazione (500 € su IBKR simulato)\n"
@@ -288,12 +301,17 @@ async def cmd_stato(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state    = load_state()
     tickers  = load_watchlist()
     paused   = state.get("paused", False)
-    status   = "⏸ In pausa" if paused else "✅ Attivo"
+    if not MARKET_REPORTS_ENABLED:
+        status    = "⏸ Report automatici sospesi"
+        schedule  = "sospesi temporaneamente (riattivabili da codice)"
+    else:
+        status    = "⏸ In pausa" if paused else "✅ Attivo"
+        schedule  = "09:30, 12:45 e 16:00 ET"
     await update.message.reply_text(
         f"*Stock monitor*\n\n"
         f"Stato: {status}\n"
         f"Ticker monitorati: {len(tickers)}\n"
-        f"Report automatici: 09:30, 12:45 e 16:00 ET",
+        f"Report automatici: {schedule}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -381,6 +399,8 @@ async def cmd_sim_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Scheduled report ──────────────────────────────────────────────────────────
 
 async def job_report(context: ContextTypes.DEFAULT_TYPE):
+    if not MARKET_REPORTS_ENABLED:
+        return
     state = load_state()
     if state.get("paused"):
         return
@@ -419,6 +439,28 @@ async def job_sim_open(context: ContextTypes.DEFAULT_TYPE):
 
 async def job_sim_close(context: ContextTypes.DEFAULT_TYPE):
     await _job_sim(context, "close")
+
+
+# ── Astrosoldi ────────────────────────────────────────────────────────────────
+
+async def cmd_astro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _check_admin(update):
+        return
+    await update.message.reply_text("⏳ Consulto la carta...")
+    try:
+        text = build_astro_message()
+    except Exception as e:
+        log.error("cmd_astro fallito: %s", e)
+        await update.message.reply_text(f"❌ Report Astrosoldi non disponibile: {e}")
+        return
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def job_astro(context: ContextTypes.DEFAULT_TYPE):
+    # Il job gira tutti i giorni: e' `is_draw_day` a decidere se c'e' estrazione.
+    if not is_draw_day():
+        return
+    await send_astro_report(context.bot)
 
 
 # ── Message handler ───────────────────────────────────────────────────────────
@@ -526,13 +568,18 @@ def main():
     app.add_handler(CommandHandler("sim_on",   cmd_sim_on))
     app.add_handler(CommandHandler("sim_off",  cmd_sim_off))
     app.add_handler(CommandHandler("sim_reset",cmd_sim_reset))
+    app.add_handler(CommandHandler("astro",    cmd_astro))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
 
-    app.job_queue.run_daily(job_report, time=dt_time(9, 30, tzinfo=ET_TZ),  name="report_open")
-    app.job_queue.run_daily(job_report, time=dt_time(12, 45, tzinfo=ET_TZ), name="report_mid")
-    app.job_queue.run_daily(job_report, time=dt_time(16, 0, tzinfo=ET_TZ), name="report_close")
+    if MARKET_REPORTS_ENABLED:
+        app.job_queue.run_daily(job_report, time=dt_time(9, 30, tzinfo=ET_TZ),  name="report_open")
+        app.job_queue.run_daily(job_report, time=dt_time(12, 45, tzinfo=ET_TZ), name="report_mid")
+        app.job_queue.run_daily(job_report, time=dt_time(16, 0, tzinfo=ET_TZ), name="report_close")
+    else:
+        log.info("Report di mercato automatici sospesi (MARKET_REPORTS_ENABLED=False).")
     app.job_queue.run_daily(job_sim_open,  time=dt_time(9, 35, tzinfo=ET_TZ), name="sim_open")
     app.job_queue.run_daily(job_sim_close, time=dt_time(16, 10, tzinfo=ET_TZ), name="sim_close")
+    app.job_queue.run_daily(job_astro, time=ASTRO_REPORT_TIME, name="astro_report")
 
     log.info("Fasmagor avviato. In ascolto...")
     app.run_polling()

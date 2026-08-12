@@ -1,0 +1,11 @@
+# Bot Telegram + bridge Claude
+python-telegram-bot[job-queue]>=20.0
+requests
+rich
+
+# Stock monitor / simulazione breakout
+yfinance
+pytz
+
+# Astrosoldi (report estrazione) — motore vendorizzato in albano_lotto/
+pyswisseph==2.10.3.2
